@@ -29,14 +29,33 @@ PER_FUNCTION_DECOMPILE_TIMEOUT_SECONDS = 30
 # kills the process with nothing written back to S3.
 
 
+def _ensure_pyghidra_started():
+    """Boots the embedded JVM with user.home forced to /tmp.
+
+    pyghidra.start() has no parameter for this, and the JDK_JAVA_OPTIONS
+    env var (which fixes Ghidra's separate LaunchSupport preflight
+    subprocess -- see Dockerfile) does not reach this embedded JVM, since
+    JPype boots it in-process via JNI rather than through the `java`
+    launcher binary. Without this, Ghidra tries to write its config under
+    the OS passwd-derived home directory (e.g. /root/.config/ghidra),
+    which is read-only in real Lambda -- verified against a simulated
+    read-only-except-/tmp filesystem.
+    """
+    if pyghidra.started():
+        return
+    from pyghidra.launcher import HeadlessPyGhidraLauncher
+    launcher = HeadlessPyGhidraLauncher(verbose=False)
+    launcher.vm_args.append("-Duser.home=/tmp")
+    launcher.start()
+
+
 def analyze_binary(
     binary_path: str,
     analysis_budget_seconds: float = DEFAULT_ANALYSIS_BUDGET_SECONDS,
     metadata_budget_seconds: float = DEFAULT_METADATA_BUDGET_SECONDS,
     decompile_budget_seconds: float = DEFAULT_DECOMPILE_BUDGET_SECONDS,
 ) -> dict:
-    if not pyghidra.started():
-        pyghidra.start(verbose=False)
+    _ensure_pyghidra_started()
 
     from ghidra.app.util.importer import ProgramLoader
 
