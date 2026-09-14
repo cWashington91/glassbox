@@ -33,9 +33,21 @@ RUN curl -fsSL -o /tmp/ghidra.zip "${GHIDRA_URL}" \
 
 ENV GHIDRA_INSTALL_DIR=/opt/ghidra
 
+# PyGhidra (native CPython bridge to Ghidra, replacing the old Jython
+# scripting engine) ships its own wheels -- including JPype, its Java
+# bridge -- inside the Ghidra distribution for offline install. Installing
+# at build time (rather than via its own interactive first-run installer)
+# keeps this consistent with "resolve dependencies at build time, no
+# network access needed at runtime."
+RUN pip install --no-index \
+    --find-links=/opt/ghidra/Ghidra/Features/PyGhidra/pypkg/dist \
+    pyghidra
+
 # --- Lambda handler (next iteration) ---
-# COPY requirements.txt ${LAMBDA_TASK_ROOT}/
-# RUN pip install -r ${LAMBDA_TASK_ROOT}/requirements.txt
+# handler.py drives PyGhidra natively (import pyghidra; pyghidra.start()) in
+# the same process -- no analyzeHeadless subprocess, no Ghidra Project
+# files on disk, no -postScript log-scraping. See ghidra_scripts/ for the
+# extraction logic prototype.
 # COPY handler.py ${LAMBDA_TASK_ROOT}/
-# COPY ghidra_scripts/ ${LAMBDA_TASK_ROOT}/ghidra_scripts/
+# COPY analysis/ ${LAMBDA_TASK_ROOT}/analysis/
 # CMD ["handler.lambda_handler"]
