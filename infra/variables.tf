@@ -51,3 +51,21 @@ variable "report_expiration_days" {
   type        = number
   default     = 30
 }
+
+variable "bedrock_model_id" {
+  description = "Bedrock model ID (or ARN) the ai-triage Lambda invokes for triage. Get the current value from the Bedrock console's Model catalog, not from documentation -- this has changed AWS-side more than once."
+  type        = string
+  default     = "anthropic.claude-sonnet-5"
+}
+
+variable "ai_triage_timeout_seconds" {
+  description = "Lambda timeout for the ai-triage function. Far lower than the Ghidra analyzer's -- this is one Bedrock call plus small JSON work, not a JVM+decompiler workload."
+  type        = number
+  default     = 60
+}
+
+variable "ai_triage_memory_mb" {
+  description = "Lambda memory for the ai-triage function. No JVM here, so this is much lighter than the analyzer's."
+  type        = number
+  default     = 256
+}

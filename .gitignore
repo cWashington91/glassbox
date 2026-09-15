@@ -12,6 +12,7 @@ override.tf.json
 *.tfvars
 *.tfvars.json
 !example.tfvars
+infra/build/
 
 # Python (Lambda handlers, Ghidra scripts)
 __pycache__/
