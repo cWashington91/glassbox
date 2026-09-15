@@ -29,9 +29,9 @@ variable "lambda_timeout_seconds" {
 }
 
 variable "lambda_memory_mb" {
-  description = "Lambda memory for the ghidra-analyzer function. Ghidra's JVM needs real headroom -- 2048MB is a starting point to tune from, not a floor requirement."
+  description = "Lambda memory for the ghidra-analyzer function. Lambda allocates vCPU proportionally to memory (~1 vCPU per 1769MB), and Ghidra's JVM is CPU-bound, so this is as much a speed dial as a RAM one -- a real test run took 112s at 2048MB (~1.16 vCPU) with only 865MB actually used, suggesting CPU share was the bottleneck, not memory headroom. 3008MB (~1.7 vCPU) is the next data point to test."
   type        = number
-  default     = 2048
+  default     = 3008
 }
 
 variable "lambda_ephemeral_storage_mb" {
