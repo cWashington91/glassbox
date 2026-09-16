@@ -1,14 +1,18 @@
 # Glassbox
 
-> Status: Stage 1 (Ghidra static analysis) is built, deployed, and
-> verified end-to-end in AWS. Stage 2 (AI triage), a full threat-model
-> write-up, an architecture diagram, and a detailed cost breakdown are
-> still to come.
+> Status: Stage 1 (Ghidra static analysis) and Stage 2 (AI triage via
+> Bedrock) are both built and deployed to AWS. Stage 1 is verified
+> end-to-end. Stage 2's plumbing (S3 trigger, report condensation, IAM,
+> the Bedrock call itself) is confirmed correctly wired -- the one thing
+> not yet confirmed live is a successful model response, currently
+> blocked on AWS's standard new-account verification hold on Bedrock
+> access. A full threat-model write-up, architecture diagram, and
+> detailed cost breakdown are still to come.
 
 An ephemeral, serverless static binary analysis pipeline: drop a binary
-into S3, get back a structured Ghidra report plus (eventually) an
-AI-generated triage summary, with no persistent compute or execution of
-the sample at any point.
+into S3, get back a structured Ghidra report plus an AI-generated triage
+summary, with no persistent compute or execution of the sample at any
+point.
 
 ## How it works today
 
@@ -23,10 +27,17 @@ the sample at any point.
    scales with binary size has its own wall-clock budget, so a large or
    complex binary degrades to a partial-but-honestly-flagged report
    instead of silently hitting Lambda's timeout with nothing written.
-4. The report is written back to the same bucket under `reports/`.
-
-Stage 2 -- an AI model interpreting that raw report into a triage
-summary -- is not built yet.
+4. That report is written back to the same bucket under `reports/`.
+5. The report write triggers a second Lambda (`lambdas/ai-triage`),
+   which condenses the report -- even a 26MB report shrinks to roughly
+   35KB, keeping full imports/strings/control-flow stats plus the
+   largest already-decompiled functions' pseudocode -- and asks Claude,
+   via Bedrock, for a structured triage: capability classification,
+   suspicious API calls, obfuscation indicators, notable strings, and a
+   confidence level.
+6. The triage result is written under `triage/`. A report representing
+   a Stage 1 failure is skipped before ever reaching Bedrock -- no
+   reason to pay for a model call on a stack trace.
 
 ## Repo layout
 
@@ -37,38 +48,55 @@ lambdas/
     handler.py             # S3 event entrypoint
     analysis/extract.py    # the actual extraction logic
     test_handler_local.py  # local smoke test, no AWS needed
-  ai-triage/                # Stage 2 (TBD)
-infra/                       # OpenTofu: VPC, S3, ECR, IAM, Lambda
+  ai-triage/
+    handler.py             # S3 event entrypoint
+    condense.py            # shrinks a report to a bounded, model-worthy payload
+    triage.py              # the Bedrock prompt + call
+    test_handler_local.py  # local smoke test, no AWS needed
+infra/                      # OpenTofu: VPC, S3, ECR, IAM, both Lambdas
 ```
 
 ## Infrastructure
 
 Deployed and tested in a single region (`us-east-1`):
 
-- **Network isolation.** The Lambda runs in a private-subnet-only VPC
-  with no Internet Gateway and no NAT Gateway -- there is no route to
-  the internet at all. S3 access goes through a free Gateway VPC
-  endpoint, additionally scoped by its own policy to this bucket only.
-  Verified in practice: CloudWatch logging still works with no NAT and
-  no Logs endpoint, since Lambda ships stdout/stderr through its own
-  internal path rather than the function's VPC networking.
-- **IAM.** The Lambda's execution role has exactly three permissions --
-  `s3:GetObject` on `incoming/*`, `s3:PutObject` on `reports/*`, and
-  `logs:CreateLogStream`/`PutLogEvents` on its own log group. No
-  `s3:ListBucket`, no `logs:CreateLogGroup`.
+- **Network isolation (Stage 1 only).** The Ghidra analyzer runs in a
+  private-subnet-only VPC with no Internet Gateway and no NAT Gateway --
+  there is no route to the internet at all. S3 access goes through a
+  free Gateway VPC endpoint, additionally scoped by its own policy to
+  this bucket only. Verified in practice: CloudWatch logging still works
+  with no NAT and no Logs endpoint, since Lambda ships stdout/stderr
+  through its own internal path rather than the function's VPC
+  networking.
+- **IAM.** Each Lambda's execution role is scoped to exactly what it
+  needs. The analyzer gets `s3:GetObject` on `incoming/*` and
+  `s3:PutObject` on `reports/*`; the triage Lambda gets `s3:GetObject`
+  on `reports/*`, `s3:PutObject` on `triage/*`, and `bedrock:InvokeModel`
+  scoped to one specific model. Both get `logs:CreateLogStream`/
+  `PutLogEvents` on their own log group -- no `s3:ListBucket`, no
+  `logs:CreateLogGroup`, anywhere.
 - **S3.** Public access fully blocked, SSE-S3 encryption, a TLS-only
   bucket policy, and a 30-day lifecycle expiration.
 - **ECR.** Immutable tags, scan-on-push, lifecycle policy expiring
-  untagged images.
+  untagged images -- used only by Stage 1.
+- **Stage 2 packaging.** A plain ZIP deployment, not a container image:
+  it's just `boto3` (already bundled in Lambda's Python runtime) plus
+  three small files, so no ECR repo or multi-GB image is needed at all.
+  Deliberately not VPC-isolated like Stage 1 -- Bedrock has no free
+  Gateway endpoint (only paid Interface endpoints), and this Lambda
+  processes Stage 1's own structured JSON output rather than raw
+  attacker-controlled bytes through a native parser, so the isolation
+  cost/benefit tradeoff points the other way here.
 - **Compute sizing.** Lambda allocates vCPU proportionally to memory,
   and Ghidra's JVM is CPU-bound -- a real test binary ran in 112s at
   2048MB but only 46s at 3008MB, with *fewer* total GB-seconds billed
   despite the higher memory, since billed cost is memory x duration.
   More memory was both faster and cheaper here, up to a point.
 - **Cost.** Comfortably inside AWS's Always Free tier at portfolio/demo
-  volume -- a real run bills roughly 140 GB-seconds, against a
-  400,000/month free allowance. ECR image storage (~$0.10/GB-month) is
-  the one line item that isn't literally free.
+  volume -- a real Stage 1 run bills roughly 140 GB-seconds, against a
+  400,000/month free allowance. ECR image storage (~$0.10/GB-month) and
+  Bedrock's per-call token cost are the line items that aren't literally
+  free, though both are small at this scale.
 
 ## Design principles
 
@@ -76,14 +104,16 @@ Deployed and tested in a single region (`us-east-1`):
   binary. Ghidra's headless analyzer disassembles/decompiles; it does
   not run the sample.
 - **No outbound internet from the analyzer.** Enforced at the network
-  layer -- the analyzer's VPC has no route to the internet, not just
-  "the code doesn't call anything."
-- **Nothing persists between runs.** No Ghidra project files ever
-  touch disk (PyGhidra's projectless load mode); the downloaded binary
-  is removed from `/tmp` even on failure, since Lambda execution
+  layer -- Stage 1's VPC has no route to the internet, not just "the
+  code doesn't call anything."
+- **Nothing persists between runs.** No Ghidra project files ever touch
+  disk (PyGhidra's projectless load mode); the downloaded binary is
+  removed from `/tmp` even on failure, since Lambda execution
   environments can be reused across invocations.
-- **Fail loud to S3, not silently into Lambda's retry logic.** Analysis
-  errors are caught and written back as an error report rather than
-  raised -- a malformed input fails the same way every time, so letting
-  it raise would mean paying for the same expensive Ghidra run 2-3x via
-  Lambda's automatic async-invoke retries.
+- **Fail loud to S3, not silently into Lambda's retry logic.** Both
+  stages catch their own failures and write back an error report rather
+  than raising. For Stage 1, a malformed input fails the same way every
+  time, so letting it raise would mean paying for the same expensive
+  Ghidra run 2-3x via Lambda's automatic async-invoke retries. Stage 2
+  goes further and skips the model call entirely for a report that's
+  already a Stage 1 failure.
