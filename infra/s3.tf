@@ -77,5 +77,17 @@ resource "aws_s3_bucket_notification" "analysis" {
     filter_prefix       = "incoming/"
   }
 
-  depends_on = [aws_lambda_permission.allow_s3_invoke]
+  # reports/ -> triage/, same self-trigger-avoidance pattern as
+  # incoming/ -> reports/ above: Stage 2 writes outside the prefix it
+  # watches, so it can never retrigger itself.
+  lambda_function {
+    lambda_function_arn = aws_lambda_function.ai_triage.arn
+    events              = ["s3:ObjectCreated:*"]
+    filter_prefix       = "reports/"
+  }
+
+  depends_on = [
+    aws_lambda_permission.allow_s3_invoke,
+    aws_lambda_permission.allow_s3_invoke_triage,
+  ]
 }
